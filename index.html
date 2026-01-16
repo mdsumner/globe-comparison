@@ -55,8 +55,8 @@
   <div id="header">
     <h1>Globe Size Comparison</h1>
     <p class="info">
-      Click a country to select it (orange). It will be copied to your current view center (red) 
-      showing its true proportional size. Drag to rotate the globe.
+      Click a country to select it (orange). A copy (red) is placed at your current view center - 
+      then rotate the globe to compare true sizes. Click again to reposition the copy.
     </p>
     <div class="legend">
       <span class="legend-item"><span class="legend-color green"></span> Countries</span>
@@ -283,7 +283,7 @@
       
       lastMouse = { x: e.clientX, y: e.clientY };
       updateViewCenter();
-      updateCopiedMesh();
+      // Don't update copied mesh - it stays fixed where it was placed
     }
     
     function onMouseUp() {
