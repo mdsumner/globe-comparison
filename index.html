@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Globe Size Comparison</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { 
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #111122; 
+      color: white; 
+      height: 100vh; 
+      display: flex; 
+      flex-direction: column;
+    }
+    #header {
+      padding: 16px;
+      background: #1f2937;
+      border-bottom: 1px solid #374151;
+    }
+    h1 { font-size: 1.25rem; margin-bottom: 8px; }
+    .info { font-size: 0.875rem; color: #9ca3af; margin-bottom: 8px; }
+    .legend { display: flex; gap: 16px; font-size: 0.875rem; }
+    .legend-item { display: flex; align-items: center; gap: 8px; }
+    .legend-color { width: 16px; height: 3px; }
+    .green { background: #22c55e; }
+    .orange { background: #f97316; }
+    .red { background: #ef4444; }
+    #selected { color: #facc15; margin-top: 8px; }
+    #viewCenter { font-size: 0.75rem; color: #6b7280; margin-top: 4px; }
+    #container { flex: 1; cursor: grab; }
+    #container:active { cursor: grabbing; }
+    #footer {
+      padding: 8px 16px;
+      background: #1f2937;
+      border-top: 1px solid #374151;
+      font-size: 0.75rem;
+      color: #6b7280;
+    }
+    #loading {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(17, 17, 34, 0.9);
+      font-size: 1.125rem;
+    }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div id="header">
+    <h1>Globe Size Comparison</h1>
+    <p class="info">
+      Click a country to select it (orange). It will be copied to your current view center (red) 
+      showing its true proportional size. Drag to rotate the globe.
+    </p>
+    <div class="legend">
+      <span class="legend-item"><span class="legend-color green"></span> Countries</span>
+      <span class="legend-item"><span class="legend-color orange"></span> Selected</span>
+      <span class="legend-item"><span class="legend-color red"></span> Comparison copy</span>
+    </div>
+    <p id="selected"></p>
+    <p id="viewCenter">View center: 0.0°, 0.0°</p>
+  </div>
+  
+  <div id="container">
+    <div id="loading">Loading countries...</div>
+  </div>
+  
+  <div id="footer">
+    Data: Natural Earth | Tip: Select Greenland, then rotate to view it over Africa or Australia
+  </div>
+
+  <script>
+    const COUNTRIES_URL = 'https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_110m_admin_0_countries.geojson';
+    
+    let scene, camera, renderer, globe;
+    let countries = [];
+    let countryMeshes = [];
+    let selectedMesh = null;
+    let copiedMesh = null;
+    let selectedCountryData = null;
+    
+    let isDragging = false;
+    let lastMouse = { x: 0, y: 0 };
+    let rotation = { x: 0, y: 0 };
+    
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    
+    // Convert lat/lon to 3D position
+    function latLonToVector3(lat, lon, radius = 1) {
+      const phi = (90 - lat) * (Math.PI / 180);
+      const theta = (lon + 180) * (Math.PI / 180);
+      return new THREE.Vector3(
+        -radius * Math.sin(phi) * Math.cos(theta),
+        radius * Math.cos(phi),
+        radius * Math.sin(phi) * Math.sin(theta)
+      );
+    }
+    
+    // Get view center from camera
+    function getCameraCenter() {
+      const pos = camera.position.clone().normalize();
+      const lat = 90 - Math.acos(pos.y) * (180 / Math.PI);
+      const lon = Math.atan2(pos.z, -pos.x) * (180 / Math.PI) - 180;
+      return { lat, lon: ((lon + 540) % 360) - 180 };
+    }
+    
+    // Calculate country centroid
+    function getCountryCentroid(geometry) {
+      let totalLat = 0, totalLon = 0, count = 0;
+      
+      const processRing = (ring) => {
+        ring.forEach(([lon, lat]) => {
+          totalLat += lat;
+          totalLon += lon;
+          count++;
+        });
+      };
+      
+      const processPolygon = (polygon) => polygon.forEach(processRing);
+      
+      if (geometry.type === 'Polygon') {
+        processPolygon(geometry.coordinates);
+      } else if (geometry.type === 'MultiPolygon') {
+        geometry.coordinates.forEach(processPolygon);
+      }
+      
+      return { lat: totalLat / count, lon: totalLon / count };
+    }
+    
+    // Create country outline mesh
+    function createCountryMesh(geometry, color = 0x44aa88, offsetLat = 0, offsetLon = 0) {
+      const group = new THREE.Group();
+      
+      const processRing = (ring) => {
+        const points = [];
+        for (let i = 0; i < ring.length; i++) {
+          let [lon, lat] = ring[i];
+          lat = Math.max(-89.9, Math.min(89.9, lat + offsetLat));
+          lon += offsetLon;
+          points.push(latLonToVector3(lat, lon, 1.001));
+        }
+        return points;
+      };
+      
+      const createLine = (points) => {
+        if (points.length < 2) return null;
+        const geom = new THREE.BufferGeometry().setFromPoints(points);
+        const mat = new THREE.LineBasicMaterial({ color, linewidth: 2 });
+        return new THREE.Line(geom, mat);
+      };
+      
+      const processPolygon = (polygon) => {
+        polygon.forEach(ring => {
+          const line = createLine(processRing(ring));
+          if (line) group.add(line);
+        });
+      };
+      
+      if (geometry.type === 'Polygon') {
+        processPolygon(geometry.coordinates);
+      } else if (geometry.type === 'MultiPolygon') {
+        geometry.coordinates.forEach(processPolygon);
+      }
+      
+      return group;
+    }
+    
+    // Initialize scene
+    function init() {
+      const container = document.getElementById('container');
+      
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x111122);
+      
+      camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 100);
+      camera.position.set(0, 0, 3);
+      
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(container.clientWidth, container.clientHeight);
+      renderer.setPixelRatio(window.devicePixelRatio);
+      container.appendChild(renderer.domElement);
+      
+      // Globe
+      const globeGeom = new THREE.SphereGeometry(1, 64, 64);
+      const globeMat = new THREE.MeshBasicMaterial({ color: 0x1a1a2e, transparent: true, opacity: 0.9 });
+      globe = new THREE.Mesh(globeGeom, globeMat);
+      scene.add(globe);
+      
+      // Graticule
+      const gratMat = new THREE.LineBasicMaterial({ color: 0x333355, transparent: true, opacity: 0.5 });
+      
+      for (let lat = -80; lat <= 80; lat += 20) {
+        const points = [];
+        for (let lon = -180; lon <= 180; lon += 5) {
+          points.push(latLonToVector3(lat, lon, 1.001));
+        }
+        scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(points), gratMat));
+      }
+      
+      for (let lon = -180; lon < 180; lon += 30) {
+        const points = [];
+        for (let lat = -90; lat <= 90; lat += 5) {
+          points.push(latLonToVector3(lat, lon, 1.001));
+        }
+        scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(points), gratMat));
+      }
+      
+      // Events
+      container.addEventListener('mousedown', onMouseDown);
+      container.addEventListener('mousemove', onMouseMove);
+      container.addEventListener('mouseup', onMouseUp);
+      container.addEventListener('mouseleave', onMouseUp);
+      container.addEventListener('click', onClick);
+      window.addEventListener('resize', onResize);
+      
+      animate();
+      loadCountries();
+    }
+    
+    function loadCountries() {
+      fetch(COUNTRIES_URL)
+        .then(res => res.json())
+        .then(data => {
+          countries = data.features.map(f => ({
+            name: f.properties.NAME || f.properties.ADMIN,
+            geometry: f.geometry,
+            centroid: getCountryCentroid(f.geometry)
+          }));
+          
+          countries.forEach((country, idx) => {
+            const mesh = createCountryMesh(country.geometry, 0x44aa88);
+            mesh.userData = { countryIndex: idx, name: country.name };
+            scene.add(mesh);
+            countryMeshes.push(mesh);
+          });
+          
+          document.getElementById('loading').classList.add('hidden');
+        })
+        .catch(err => {
+          console.error('Failed to load countries:', err);
+          document.getElementById('loading').textContent = 'Failed to load countries';
+        });
+    }
+    
+    function animate() {
+      requestAnimationFrame(animate);
+      renderer.render(scene, camera);
+    }
+    
+    function onResize() {
+      const container = document.getElementById('container');
+      camera.aspect = container.clientWidth / container.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(container.clientWidth, container.clientHeight);
+    }
+    
+    function onMouseDown(e) {
+      isDragging = true;
+      lastMouse = { x: e.clientX, y: e.clientY };
+    }
+    
+    function onMouseMove(e) {
+      if (!isDragging) return;
+      
+      const deltaX = e.clientX - lastMouse.x;
+      const deltaY = e.clientY - lastMouse.y;
+      
+      rotation.y += deltaX * 0.005;
+      rotation.x = Math.max(-Math.PI / 2 + 0.1, Math.min(Math.PI / 2 - 0.1, rotation.x + deltaY * 0.005));
+      
+      const radius = 3;
+      camera.position.x = radius * Math.sin(rotation.y) * Math.cos(rotation.x);
+      camera.position.y = radius * Math.sin(rotation.x);
+      camera.position.z = radius * Math.cos(rotation.y) * Math.cos(rotation.x);
+      camera.lookAt(0, 0, 0);
+      
+      lastMouse = { x: e.clientX, y: e.clientY };
+      updateViewCenter();
+      updateCopiedMesh();
+    }
+    
+    function onMouseUp() {
+      isDragging = false;
+    }
+    
+    function onClick(e) {
+      if (Math.abs(e.clientX - lastMouse.x) > 5 || Math.abs(e.clientY - lastMouse.y) > 5) return;
+      
+      const container = document.getElementById('container');
+      const rect = container.getBoundingClientRect();
+      mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObjects(countryMeshes, true);
+      
+      if (intersects.length > 0) {
+        let obj = intersects[0].object;
+        while (obj.parent && !obj.userData.name) obj = obj.parent;
+        if (obj.userData.name) selectCountry(obj.userData.countryIndex);
+      }
+    }
+    
+    function selectCountry(index) {
+      const country = countries[index];
+      selectedCountryData = country;
+      
+      document.getElementById('selected').textContent = 'Selected: ' + country.name;
+      
+      if (selectedMesh) scene.remove(selectedMesh);
+      if (copiedMesh) scene.remove(copiedMesh);
+      
+      selectedMesh = createCountryMesh(country.geometry, 0xffaa00);
+      scene.add(selectedMesh);
+      
+      updateCopiedMesh();
+    }
+    
+    function updateCopiedMesh() {
+      if (!selectedCountryData) return;
+      
+      if (copiedMesh) scene.remove(copiedMesh);
+      
+      const center = getCameraCenter();
+      const offsetLat = center.lat - selectedCountryData.centroid.lat;
+      const offsetLon = center.lon - selectedCountryData.centroid.lon;
+      
+      copiedMesh = createCountryMesh(selectedCountryData.geometry, 0xff4444, offsetLat, offsetLon);
+      scene.add(copiedMesh);
+    }
+    
+    function updateViewCenter() {
+      const center = getCameraCenter();
+      document.getElementById('viewCenter').textContent = 
+        `View center: ${center.lat.toFixed(1)}°, ${center.lon.toFixed(1)}°`;
+    }
+    
+    init();
+  </script>
+</body>
+</html>
